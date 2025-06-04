@@ -1,100 +1,148 @@
 #!/usr/bin/env python3
+"""Generate a delta file describing the differences between two binaries."""
 
-import sys
+from __future__ import annotations
+
 import struct
+import sys
+from dataclasses import dataclass, field
 from enum import IntEnum
+from typing import Optional, BinaryIO
 
-MAX_BLK = 1024 * 100
+
+MAX_BLK = 1024 * 100  # Maximum block inspected when searching for matches
+
 
 class EOPERATION(IntEnum):
+    """Operations supported in the delta format."""
+
     COPY = 0
     INSERT = 1
     NU_OP = 2
 
+
+@dataclass
 class FileInfo:
-    def __init__(self, f):
-        self.f = f
-        self.read_pos = 0
-        f.seek(0, 2)
-        self.total_size = f.tell()
-        f.seek(0)
+    """Store information about an opened file."""
 
+    f: BinaryIO
+    total_size: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.f.seek(0, 2)
+        self.total_size = self.f.tell()
+        self.f.seek(0)
+
+
+@dataclass
 class CopyData:
-    def __init__(self, orig_pos, size):
-        self.u32OrigFilePos = orig_pos
-        self.u32Size = size
+    """Describe a segment that should be copied from the origin file."""
 
+    u32OrigFilePos: int
+    u32Size: int
+
+
+@dataclass
 class InsertData:
-    def __init__(self, final_pos, data):
-        self.u32FinalFilePos = final_pos
-        self.u32Size = len(data)
-        self.pBlock = data
+    """Describe raw data to be inserted in the resulting file."""
 
+    u32FinalFilePos: int
+    pBlock: bytes
+
+    @property
+    def u32Size(self) -> int:
+        return len(self.pBlock)
+
+
+@dataclass
 class FileBlock:
-    def __init__(self, prev=None):
-        self.eType = EOPERATION.NU_OP
-        self.pData = None
-        self.pNextFileBlock = None
-        self.pPrevFileBlock = prev
-        if prev:
-            prev.pNextFileBlock = self
+    """Node used to build the list of delta operations."""
 
-def new_file_block(prev):
-    return FileBlock(prev)
+    eType: EOPERATION = EOPERATION.NU_OP
+    pData: Optional[object] = None
+    pPrevFileBlock: Optional[FileBlock] = None
+    pNextFileBlock: Optional[FileBlock] = None
 
-def make_insert_block(psFb, buffer, startpos, sz):
-    p = new_file_block(psFb)
-    p.eType = EOPERATION.INSERT
-    pdata = InsertData(startpos, buffer[:sz])
-    p.pData = pdata
-    return p
 
-def make_copy_block(psFb, startpos, sz):
-    p = new_file_block(psFb)
-    p.eType = EOPERATION.COPY
-    p.pData = CopyData(startpos, sz)
-    return p
+def new_file_block(prev: Optional[FileBlock]) -> FileBlock:
+    """Allocate a new ``FileBlock`` linked to ``prev``."""
 
-def print_tracker_file_blocks(blocks, fout):
+    fb = FileBlock(pPrevFileBlock=prev)
+    if prev is not None:
+        prev.pNextFileBlock = fb
+    return fb
+
+
+def make_insert_block(psFb: Optional[FileBlock], buffer: bytes, startpos: int, sz: int) -> FileBlock:
+    """Create an ``INSERT`` block with ``sz`` bytes from ``buffer``."""
+
+    block = new_file_block(psFb)
+    block.eType = EOPERATION.INSERT
+    block.pData = InsertData(startpos, buffer[:sz])
+    return block
+
+
+def make_copy_block(psFb: Optional[FileBlock], startpos: int, sz: int) -> FileBlock:
+    """Create a ``COPY`` block referencing ``startpos`` with length ``sz``."""
+
+    block = new_file_block(psFb)
+    block.eType = EOPERATION.COPY
+    block.pData = CopyData(startpos, sz)
+    return block
+
+
+def print_tracker_file_blocks(blocks: Optional[FileBlock], fout: BinaryIO) -> None:
+    """Write the chain of ``blocks`` to ``fout`` in the delta format."""
+
+    # Find the first block
     while blocks and blocks.pPrevFileBlock:
         blocks = blocks.pPrevFileBlock
-    i = 0
+
+    finalsize = 0
+    idx = 0
     while blocks:
         if blocks.eType == EOPERATION.COPY:
-            d = blocks.pData
-            fout.write(struct.pack('<I', blocks.eType))
-            fout.write(struct.pack('<I', d.u32OrigFilePos))
-            fout.write(struct.pack('<I', d.u32Size))
-            print(f"OP[{i}]: COPY")
+            d: CopyData = blocks.pData  # type: ignore[assignment]
+            fout.write(struct.pack("<I", blocks.eType))
+            fout.write(struct.pack("<I", d.u32OrigFilePos))
+            fout.write(struct.pack("<I", d.u32Size))
+            finalsize += d.u32Size
         elif blocks.eType == EOPERATION.INSERT:
-            d = blocks.pData
-            fout.write(struct.pack('<I', blocks.eType))
-            fout.write(struct.pack('<I', d.u32FinalFilePos))
-            fout.write(struct.pack('<I', d.u32Size))
+            d: InsertData = blocks.pData  # type: ignore[assignment]
+            fout.write(struct.pack("<I", blocks.eType))
+            fout.write(struct.pack("<I", d.u32FinalFilePos))
+            fout.write(struct.pack("<I", d.u32Size))
             fout.write(d.pBlock)
-            print(f"OP[{i}]: INSERT")
+            finalsize += d.u32Size
         blocks = blocks.pNextFileBlock
-        i += 1
+        idx += 1
 
-def find_matches(args):
+    print(f"finalsize: {finalsize}")
+
+def find_matches(
+    origin: FileInfo,
+    end: FileInfo,
+    buf_orig: bytes,
+    buf_final: bytes,
+    out: BinaryIO,
+) -> None:
+    """Compare ``buf_orig`` and ``buf_final`` and write delta operations."""
+
     last_pos = 0
-    sEnd = args['sEnd']
-    sOrigin = args['sOrigin']
-    pBufOrig = args['pBufferOriginal']
-    pBufFinal = args['pBufferFinal']
-    psFb = None
+    psFb: Optional[FileBlock] = None  # tail of the operations list
+    u32TotalSaved = 0
     u32Total = 0
     idxFinalFile = 0
 
-    while idxFinalFile < sEnd.total_size:
-        idxFinalMem = 0
-        idxOrigCmpMem = 0
-        zm = 0
-        for idxOrigCmpFile in range(0, sOrigin.total_size, 4):
+    while idxFinalFile < end.total_size:
+        idxFinalMem = 0  # best match position in final file
+        idxOrigCmpMem = 0  # best match position in origin file
+        zm = 0  # length of the best match
+        for idxOrigCmpFile in range(0, origin.total_size, 4):
             for z in range(4, MAX_BLK, 4):
-                if idxOrigCmpFile + z > sOrigin.total_size or idxFinalFile + z > sEnd.total_size:
+                if idxOrigCmpFile + z > origin.total_size or idxFinalFile + z > end.total_size:
                     continue
-                if pBufOrig[idxOrigCmpFile:idxOrigCmpFile+z] != pBufFinal[idxFinalFile:idxFinalFile+z]:
+                if buf_orig[idxOrigCmpFile:idxOrigCmpFile+z] != buf_final[idxFinalFile:idxFinalFile+z]:
                     break
                 if z > zm:
                     idxFinalMem = idxFinalFile
@@ -105,47 +153,43 @@ def find_matches(args):
                 if psFb is None:
                     last_pos = 0
                 if last_pos != idxFinalMem:
-                    psFb = make_insert_block(psFb, pBufFinal[last_pos:idxFinalMem], last_pos, idxFinalMem - last_pos)
+                    psFb = make_insert_block(psFb, buf_final[last_pos:idxFinalMem], last_pos, idxFinalMem - last_pos)
+                    u32Total += idxFinalMem - last_pos
                 psFb = make_copy_block(psFb, idxOrigCmpMem, zm)
+                u32TotalSaved += zm
                 u32Total += zm
                 last_pos = idxFinalFile + zm
             idxFinalFile += zm
         else:
             idxFinalFile += 4
 
-    if psFb and isinstance(psFb.pData, CopyData):
-        pc = psFb.pData
-        end_pos = pc.u32OrigFilePos + pc.u32Size
-        if end_pos < sEnd.total_size:
-            psFb = make_insert_block(psFb, pBufFinal[end_pos:], end_pos, sEnd.total_size - end_pos)
+    if u32Total < end.total_size:
+        psFb = make_insert_block(psFb, buf_final[u32Total:], u32Total, end.total_size - u32Total)
 
-    ratio = 1.0 - float(u32Total) / float(sEnd.total_size)
-    print(f"Total: {sEnd.total_size} , igual: {u32Total}, ratio: {ratio} ")
+    ratio = 1.0 - float(u32TotalSaved) / float(end.total_size)
+    print(f"Total: {end.total_size} , igual: {u32TotalSaved}, ratio: {ratio} ")
 
-    print_tracker_file_blocks(psFb, args['out'])
+    # Persist operations to the output file
+    if psFb:
+        print_tracker_file_blocks(psFb, out)
 
 
-def main():
+def main() -> None:
+    """Entry point: generate a delta file from two binary inputs."""
+
     if len(sys.argv) < 4:
         print(f"Falta de parametros {sys.argv[0]} <old file> <new file> <delta file>")
         sys.exit(1)
 
-    with open(sys.argv[1], 'rb') as hOrig, open(sys.argv[2], 'rb') as hNew, open(sys.argv[3], 'wb') as hPatch:
+    # Load both files entirely into memory
+    with open(sys.argv[1], "rb") as hOrig, open(sys.argv[2], "rb") as hNew, open(sys.argv[3], "wb") as hPatch:
         sOriginalFile = FileInfo(hOrig)
         sEndFile = FileInfo(hNew)
 
         pBufferOriginal = hOrig.read()
         pBufferFinal = hNew.read()
 
-        args = {
-            'sEnd': sEndFile,
-            'sOrigin': sOriginalFile,
-            'pBufferOriginal': pBufferOriginal,
-            'pBufferFinal': pBufferFinal,
-            'out': hPatch
-        }
-
-        find_matches(args)
+        find_matches(sOriginalFile, sEndFile, pBufferOriginal, pBufferFinal, hPatch)
 
 if __name__ == '__main__':
     main()
